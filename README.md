@@ -137,6 +137,12 @@ recognize yet. The message is in the log (with anything key-shaped redacted); ad
 `[model_providers.agentrouter]` (and update `model_provider =` to match) or edit the section name
 in `server.mjs` and `wire-config.mjs`.
 
+**`provider_key_unavailable` (503).** The proxy could not find your key. It reads
+`experimental_bearer_token` from the `[model_providers.agentrouter]` section, or the variable named
+by `env_key` if you use that instead. Note that the autostart task launches at logon and only sees
+variables set **persistently** (System Properties, or `setx`) — one exported in a terminal session
+will not reach it. Putting the token in `config.toml` avoids the problem entirely.
+
 **Not on Windows.** Skip `setup.ps1`. Run `node wire-config.mjs` to edit the config, then keep
 `node server.mjs` running however you prefer — launchd, systemd, or just a terminal.
 
