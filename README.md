@@ -98,15 +98,37 @@ curl http://127.0.0.1:17863/health
 ```
 
 ```json
-{"service":"codex-agentrouter-recovery-proxy","version":"1.0.0","requests":12,"retries":1,"recovered":1,"filtered":3}
+{
+  "service": "codex-agentrouter-recovery-proxy", "version": "1.0.0",
+  "requests": 2, "retries": 1, "recovered": 1, "filtered": 1,
+  "recent": [
+    {"at": "2026-09-13T09:56:38.898Z", "event": "encrypted_reasoning_retry", "removed": 1},
+    {"at": "2026-09-13T09:56:42.600Z", "event": "encrypted_reasoning_recovered", "removed": 1}
+  ]
+}
 ```
 
 - `retries` — times a rejection was detected and the request re-sent
 - `recovered` — times that retry produced a working response
 - `filtered` — blobs dropped up front because they were already known bad
+- `recent` — the last 20 events, so you can see *why* a number looks off
 
-`retries` can exceed `recovered`: if the retry hits an unrelated failure (AgentRouter 502s are
-common), it is counted honestly as not recovered.
+`retries` can exceed `recovered`. If the retry hits an unrelated failure — AgentRouter 502s are
+common — it is counted honestly as not recovered, and `/health` says so directly:
+
+```json
+{
+  "retries": 4, "recovered": 1,
+  "note": "3 retries did not recover; see recent[] for why (an upstream 5xx is not an encryption problem)",
+  "recent": [{"at": "...", "event": "encrypted_reasoning_retry_failed", "status": 502, "reason": "upstream_failure"}]
+}
+```
+
+A `reason` of `upstream_failure` means the gateway was flaky and the next attempt will probably
+work. `still_rejected` means the retry was refused again, which is the case worth investigating.
+
+`recent` deliberately carries no upstream message text — `/health` needs no token, so the scrubbed
+message stays in `proxy.stderr.log` and only the event shape is exposed.
 
 ## Uninstall
 

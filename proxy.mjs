@@ -138,6 +138,17 @@ export function createProxy({ upstream, getToken, logger = () => {}, maxBody = M
   if (upstreamUrl.protocol !== 'https:' && !(upstreamUrl.protocol === 'http:' && upstreamUrl.hostname === '127.0.0.1')) throw new Error('HTTPS upstream required');
   const rejected = new Set();
   const counters = { requests: 0, retries: 0, recovered: 0, filtered: 0 };
+  // A bounded trace of what just happened, so /health explains a retries-vs-recovered
+  // gap on its own instead of sending someone off to correlate log timestamps.
+  const recent = [];
+  const log = entry => {
+    // /health needs no token, so the scrubbed upstream text stays in the log file
+    // and only the event shape reaches the ring.
+    const { message, ...shape } = entry;
+    recent.push({ at: new Date().toISOString(), ...shape });
+    if (recent.length > 20) recent.shift();
+    logger(entry);
+  };
   let active = 0;
   const server = http.createServer(async (req, res) => {
     const fail = (status, code) => {
@@ -149,8 +160,14 @@ export function createProxy({ upstream, getToken, logger = () => {}, maxBody = M
     const address = server.address();
     if (req.headers.host !== `127.0.0.1:${address.port}` || req.headers.origin) { fail(403, 'local_clients_only'); return; }
     if (req.method === 'GET' && req.url === '/health') {
+      // retries counts detections; recovered counts retries that actually worked.
+      // The gap is usually an unrelated upstream failure, so say that outright.
+      const unresolved = counters.retries - counters.recovered;
+      const note = unresolved > 0
+        ? `${unresolved} retr${unresolved === 1 ? 'y' : 'ies'} did not recover; see recent[] for why (an upstream 5xx is not an encryption problem)`
+        : undefined;
       res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
-      res.end(JSON.stringify({ service: 'codex-agentrouter-recovery-proxy', version: '1.0.0', ...counters }));
+      res.end(JSON.stringify({ service: 'codex-agentrouter-recovery-proxy', version: '1.0.0', ...counters, ...(note ? { note } : {}), recent }));
       return;
     }
     let token;
@@ -195,7 +212,7 @@ export function createProxy({ upstream, getToken, logger = () => {}, maxBody = M
         payload = { ...payload, input: payload.input.filter(item => !isOpaqueReasoning(item)) };
         body = Buffer.from(JSON.stringify(payload));
         counters.retries++;
-        logger({ event: 'encrypted_reasoning_retry', removed: candidates.length });
+        log({ event: 'encrypted_reasoning_retry', removed: candidates.length });
         response = await send();
         currentProbe = await probe(response);
         if (response.ok && !currentProbe.encryptedError && !currentProbe.failed) {
@@ -204,10 +221,17 @@ export function createProxy({ upstream, getToken, logger = () => {}, maxBody = M
             rejected.add(digest(item.encrypted_content));
             if (rejected.size > 4096) rejected.delete(rejected.values().next().value);
           }
-          logger({ event: 'encrypted_reasoning_recovered', removed: candidates.length });
+          log({ event: 'encrypted_reasoning_recovered', removed: candidates.length });
+        } else {
+          // Without this the gap between retries and recovered has no explanation.
+          log({
+            event: 'encrypted_reasoning_retry_failed',
+            status: response.status,
+            reason: currentProbe.encryptedError ? 'still_rejected' : 'upstream_failure',
+          });
         }
       } else if ([400, 422].includes(response.status)) {
-        logger({
+        log({
           event: currentProbe.encryptedError ? 'bound_item_not_recoverable' : 'unhandled_upstream_rejection',
           status: response.status,
           ...describeError(currentProbe.chunks),
@@ -224,7 +248,7 @@ export function createProxy({ upstream, getToken, logger = () => {}, maxBody = M
       }
       res.end();
     } catch (error) {
-      logger({ event: controller.signal.aborted ? 'request_aborted' : 'request_failed', status: error.status ?? 502 });
+      log({ event: controller.signal.aborted ? 'request_aborted' : 'request_failed', status: error.status ?? 502 });
       fail(error.status ?? 502, controller.signal.aborted ? 'request_aborted' : (error.status ? error.message : 'upstream_connection_failed'));
     } finally {
       controller.abort();

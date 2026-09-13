@@ -202,6 +202,40 @@ test('a retry returning a different SSE failure is not cached as recovered', asy
   assert.equal((await (await fetch(f.url + '/health')).json()).recovered, 0);
 });
 
+test('health explains a retries-vs-recovered gap without exposing upstream text', async t => {
+  // The retry hits an unrelated 502, which is exactly the shape that made the
+  // bare counters look like the proxy was failing when it was not.
+  const f = await fixture(t, (req, res, body, count) => {
+    if (count === 1) { res.writeHead(400, { 'content-type': 'application/json' }); res.end(JSON.stringify(err)); }
+    else { res.writeHead(502, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: { message: 'Bad gateway' } })); }
+  });
+  await (await f.send({ model: 'test', input: [bad, user] })).text();
+  const health = await (await fetch(f.url + '/health')).json();
+  assert.equal(health.retries, 1);
+  assert.equal(health.recovered, 0);
+  assert.match(health.note, /did not recover/);
+  const failed = health.recent.find(entry => entry.event === 'encrypted_reasoning_retry_failed');
+  assert.equal(failed.status, 502);
+  assert.equal(failed.reason, 'upstream_failure');
+  assert.ok(failed.at);
+});
+
+test('the health ring is bounded and never carries scrubbed upstream messages', async t => {
+  const secret = 'gAAAA' + 'y'.repeat(60);
+  const unknown = { error: { message: `Unseen wording ${secret}.`, type: 'invalid_request_error', code: 'novel_code' } };
+  const f = await fixture(t, (req, res) => { res.writeHead(400, { 'content-type': 'application/json' }); res.end(JSON.stringify(unknown)); });
+  for (let i = 0; i < 25; i++) await (await f.send({ model: 'test', input: [user] })).text();
+  const health = await (await fetch(f.url + '/health')).json();
+  assert.equal(health.recent.length, 20);
+  // The code identifies the shape; the message itself stays in the log file only.
+  assert.equal(health.recent.at(-1).event, 'unhandled_upstream_rejection');
+  assert.equal(health.recent.at(-1).code, 'novel_code');
+  assert.equal(health.recent.at(-1).message, undefined);
+  assert.ok(!JSON.stringify(health).includes(secret));
+  // The full scrubbed message still reaches the logger for the log file.
+  assert.ok(f.logs.some(entry => entry.message?.includes('<redacted>')));
+});
+
 test('authentication, browser origin, host checks, route allowlist prevent unauthorized forwarding', async t => {
   const f = await fixture(t, (req, res) => res.end('{}'));
   assert.equal((await f.send({}, { authorization: 'Bearer wrong' })).status, 401);
