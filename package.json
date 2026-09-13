@@ -1,0 +1,12 @@
+{
+  "name": "codex-agentrouter-recovery-proxy",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "start": "node server.mjs",
+    "lint": "node --check proxy.mjs && node --check server.mjs && node --check test.mjs && node --check live-check.mjs && node --check wire-config.mjs",
+    "test": "node --test test.mjs"
+  }
+}

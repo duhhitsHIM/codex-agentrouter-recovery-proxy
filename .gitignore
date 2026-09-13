@@ -1,0 +1,4 @@
+# Runtime artifacts, not source.
+proxy.pid
+*.log
+node_modules/
