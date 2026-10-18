@@ -50,9 +50,78 @@ Deliberate limits, because getting these wrong is worse than the bug:
 
 - **It never replays a request after visible model output.** Once a single token or tool call has
   reached you, a retry could duplicate a side effect, so the error is passed through instead.
-- **It only ever strips `reasoning` items.** `compaction` items also carry `encrypted_content`, but
-  dropping one would delete conversation history, so a compaction-only failure is passed through.
-- **It retries once.** A second failure goes to the client rather than looping.
+- **It only ever strips `reasoning` items.** It never deletes `compaction` items. Optional checkpoint
+  recovery can rebuild them as described below; without usable checkpoints, the error is passed through.
+- **Retries are bounded.** Reasoning gets one retry. Optional compaction recovery gets one final
+  request retry after rebuilding its dependencies; it never loops on the final request.
+
+## Optional compaction checkpoint recovery
+
+Encrypted compaction items carry conversation memory, including facts from older tool results.
+Deleting one can let a turn finish while losing those facts. Checkpoint recovery instead rebuilds
+each dependent compaction on the current backend, starting with the earliest checkpoint, and
+replaces the old item in the original request. Historical tool calls/results and media are input
+data during replay: the proxy never executes a tool or asks Codex to execute one again.
+
+This is **opt-in**, because it stores full compaction request bodies, not just hashes. These bodies
+can contain private conversation text, tool results and embedded media. Proxy authorization headers
+and endpoint configuration are not stored. On POSIX systems, directories use mode 0700 and files
+use mode 0600; existing directories with broader permissions are rejected. On Windows, also restrict
+the state directory's ACL to your account. Treat this
+directory as private conversation history and keep it outside version control and shared folders.
+
+For a terminal launch, enable capture **before** the conversation's first remote compaction:
+
+```powershell
+$env:CODEX_RECOVERY_COMPACTION = '1'
+node server.mjs
+```
+
+Or in a POSIX shell:
+
+```sh
+CODEX_RECOVERY_COMPACTION=1 node server.mjs
+```
+
+For an installed Windows scheduled task, set the environment variable persistently for the user
+running that task, then restart the task. A variable exported only in a terminal does not enable
+capture in an already-running proxy.
+
+State defaults to the `compaction-recovery` directory inside your Codex home directory under the
+OS user's home. Set `CODEX_RECOVERY_STATE_DIR` to choose another private directory. Programmatic
+integrations can pass `compactionStore: new FileCompactionStore(directory)` to `createProxy`;
+`FileCompactionStore` is exported by `compaction.mjs`.
+
+Recovery works as follows:
+
+1. Save each successful v2 compaction request and its encrypted result before exposing the
+   completed event to the client.
+2. When an early encrypted-content rejection includes compaction, look up its dependencies.
+   Rebuild C1, then use C1's new result to rebuild C2, and so on through the latest checkpoint.
+3. Retry the original request with the rebuilt compaction. All other input items and request
+   fields are preserved, apart from the existing incompatible-reasoning recovery.
+4. Persist replacements under a digest of the endpoint and current credential, allowing later
+   requests and process restarts to reuse them. A rejected cached replacement triggers a rebuild.
+
+Limits:
+
+- Supports the v2 `compaction_trigger` protocol on `POST /v1/responses`, checked with Codex
+  0.162.1. The legacy `POST /v1/responses/compact` path keeps its existing behavior.
+- All dependent checkpoints must have been captured. There is no automatic import from existing
+  Codex rollout files in this version. Missing, damaged, cyclic or excessive dependencies preserve
+  the rejection; the proxy does not substitute an empty history. The limit is 64 uncached checkpoints
+  per recovery, within the original request timeout.
+- The target must support the saved model and v2 compaction, and accept the new encrypted results
+  across replay calls. A backend that rotates incompatibly on every call can still reject recovery.
+- Recompression produces a new summary; it does not guarantee verbatim or lossless retention of
+  arbitrary history. Missing media or unavailable external image references cannot be recreated.
+- Replays consume model tokens and add latency. Stored history is not automatically expired,
+  because removing an older checkpoint can break a newer one's dependency chain. Deleting state
+  disables recovery for the affected history; it does not modify Codex rollout files.
+
+Health adds `compactionRetries`, `compactionRecovered` and `compactionReplays`. Events such as
+`compaction_checkpoint_saved`, `compaction_checkpoint_rebuilt`, `compaction_recovered` and
+`compaction_recovery_failed` contain only event metadata, never checkpoint bodies or paths.
 
 ## Requirements
 
@@ -179,12 +248,14 @@ will not reach it. Putting the token in `config.toml` avoids the problem entirel
 - Your token is read from `~/.codex/config.toml` at request time and is never written to disk or
   logged. Logs contain event names, counts and status codes — never prompts, completions or
   encrypted payloads. The test suite asserts this.
+- Optional compaction state is separate from logs and deliberately contains private conversation
+  bodies and encrypted results. It is disabled by default; see the checkpoint recovery section.
 
 ## Development
 
 ```bash
 npm run lint    # syntax check
-npm test        # 18 tests, no network
+npm test        # local fixtures only, no external network
 ```
 
 `live-check.mjs` is an opt-in check against the real gateway. It sends one synthetic prompt plus a
