@@ -23,7 +23,7 @@ async function fixture(t, handler, options = {}) {
     let body = '';
     for await (const chunk of req) body += chunk;
     const data = body ? JSON.parse(body) : null;
-    requests.push({ body: data, headers: req.headers, url: req.url });
+    requests.push({ body: data, rawBody: body, headers: req.headers, url: req.url });
     await handler(req, res, data, requests.length);
   });
   upstream.listen(0, '127.0.0.1');
@@ -97,6 +97,89 @@ test('healthy streaming request retains encrypted reasoning and complete stream'
   assert.equal(await (await f.send(payload)).text(), success);
   assert.deepEqual(f.requests[0].body, payload);
   assert.equal(f.requests.length, 1);
+});
+
+test('chat completion JSON preserves messages, media, tool history and upstream reply', async t => {
+  const payload = {
+    model: 'test', stream: false,
+    messages: [
+      { role: 'system', content: 'Keep the conversation.' },
+      { role: 'user', content: [{ type: 'text', text: 'Compare saved facts.' }, { type: 'image_url', image_url: { url: 'data:image/png;base64,Zml4dHVyZQ==' } }, { type: 'input_audio', input_audio: { data: 'Zml4dHVyZQ==', format: 'wav' } }] },
+      { role: 'assistant', content: null, tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'example', arguments: '{}' } }] },
+      { role: 'tool', tool_call_id: 'call_1', content: 'Original saved tool result.' },
+    ],
+    tools: [{ type: 'function', function: { name: 'example', parameters: { type: 'object', properties: {} } } }],
+    tool_choice: 'auto', response_format: { type: 'json_object' },
+  };
+  const reply = { id: 'chatcmpl_fixture', object: 'chat.completion', choices: [{ index: 0, finish_reason: 'tool_calls', message: { role: 'assistant', content: null, tool_calls: [{ id: 'call_2', type: 'function', function: { name: 'example', arguments: '{}' } }] } }], usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 } };
+  const f = await fixture(t, (req, res) => { res.writeHead(200, { 'content-type': 'application/json', 'x-request-id': 'chat-fixture' }); res.end(JSON.stringify(reply)); }, { compactionStore: {} });
+  const raw = JSON.stringify(payload, null, 2);
+  const response = await fetch(f.url + '/v1/chat/completions?fixture=1', { method: 'POST', headers: { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json' }, body: raw });
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get('x-request-id'), 'chat-fixture');
+  assert.deepEqual(await response.json(), reply);
+  assert.equal(f.requests.length, 1);
+  assert.equal(f.requests[0].url, '/v1/chat/completions?fixture=1');
+  assert.equal(f.requests[0].rawBody, raw);
+  assert.deepEqual(f.requests[0].body, payload);
+  assert.equal(f.logs.length, 0);
+});
+
+test('chat streams tool-call deltas, usage and DONE before upstream closes', async t => {
+  let release;
+  const hold = new Promise(resolve => { release = resolve; });
+  t.after(() => release());
+  const first = sse({ id: 'chatcmpl_fixture', object: 'chat.completion.chunk', choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: 'call_1', type: 'function', function: { name: 'example', arguments: '{' } }] }, finish_reason: null }] });
+  const rest = sse({ id: 'chatcmpl_fixture', object: 'chat.completion.chunk', choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: '}' } }] }, finish_reason: 'tool_calls' }] }) + sse({ object: 'chat.completion.chunk', choices: [], usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 } }) + 'data: [DONE]\n\n';
+  const f = await fixture(t, async (req, res) => { res.writeHead(200, { 'content-type': 'text/event-stream' }); res.write(first); await hold; res.end(rest); });
+  const payload = { model: 'test', messages: [{ role: 'user', content: 'Use the fixture tool.' }], stream: true, stream_options: { include_usage: true } };
+  const response = await f.send(payload, {}, '/v1/chat/completions');
+  const reader = response.body.getReader();
+  const part = await reader.read();
+  assert.equal(Buffer.from(part.value).toString(), first);
+  release();
+  let received = '';
+  while (true) { const { done, value } = await reader.read(); if (done) break; received += Buffer.from(value).toString(); }
+  assert.equal(received, rest);
+  assert.deepEqual(f.requests[0].body, payload);
+  assert.equal(f.requests.length, 1);
+});
+
+test('chat errors bypass reasoning caches, compaction state and all recovery retries', async t => {
+  let stateCalls = 0;
+  const store = new Proxy({}, { get() { stateCalls++; throw new Error('chat_must_not_access_compaction_state'); } });
+  const formats = [
+    { status: 400, contentType: 'application/json', body: JSON.stringify(err) },
+    { status: 422, contentType: 'application/json', body: JSON.stringify(azure) },
+    { status: 200, contentType: 'text/event-stream', body: sse({ type: 'error', ...err }) },
+  ];
+  let chatRequests = 0;
+  const f = await fixture(t, (req, res, body) => {
+    if (req.url === '/v1/responses') {
+      if (body.input.some(item => item.type === 'reasoning')) { res.writeHead(400, { 'content-type': 'application/json' }); res.end(JSON.stringify(err)); }
+      else { res.writeHead(200, { 'content-type': 'text/event-stream' }); res.end(success); }
+      return;
+    }
+    const format = formats[Math.min(chatRequests++, formats.length - 1)];
+    res.writeHead(format.status, { 'content-type': format.contentType }); res.end(format.body);
+  }, { compactionStore: store });
+  // Seed the Responses rejected-reasoning cache, then ensure Chat extensions are
+  // still forwarded byte-for-byte rather than interpreted as Responses input.
+  assert.equal(await (await f.send({ input: [bad, user], stream: true })).text(), success);
+  const payload = { model: 'test', messages: [{ role: 'user', content: 'Keep this request.' }], input: [bad, compaction, { type: 'compaction_trigger' }] };
+  for (const format of formats) {
+    const response = await f.send(payload, {}, '/v1/chat/completions');
+    assert.equal(response.status, format.status);
+    assert.equal(await response.text(), format.body);
+  }
+  const chat = f.requests.filter(request => request.url === '/v1/chat/completions');
+  assert.equal(chat.length, formats.length);
+  assert.ok(chat.every(request => request.rawBody === JSON.stringify(payload)));
+  assert.equal(stateCalls, 0);
+  const health = await (await fetch(f.url + '/health')).json();
+  assert.equal(health.retries, 1);
+  assert.equal(health.compactionRetries, 0);
+  assert.equal(health.compactionReplays, 0);
 });
 
 test('real HTTP 400 retries once, preserves messages/tools/compaction, remembers rejected blobs', async t => {
@@ -238,8 +321,10 @@ test('the health ring is bounded and never carries scrubbed upstream messages', 
 
 test('authentication, browser origin, host checks, route allowlist prevent unauthorized forwarding', async t => {
   const f = await fixture(t, (req, res) => res.end('{}'));
-  assert.equal((await f.send({}, { authorization: 'Bearer wrong' })).status, 401);
-  assert.equal((await f.send({}, { origin: 'https://example.com' })).status, 403);
+  for (const route of ['/v1/responses', '/v1/chat/completions']) {
+    assert.equal((await f.send({}, { authorization: 'Bearer wrong' }, route)).status, 401);
+    assert.equal((await f.send({}, { origin: 'https://example.com' }, route)).status, 403);
+  }
   // fetch normalizes Host; use the HTTP API to test an actual hostile header.
   const hostStatus = await new Promise((resolve, reject) => {
     const req = http.request(f.url + '/v1/responses', { method: 'POST', headers: { host: 'evil.example', authorization: `Bearer ${TOKEN}` } }, res => { res.resume(); resolve(res.statusCode); });
@@ -247,6 +332,8 @@ test('authentication, browser origin, host checks, route allowlist prevent unaut
   });
   assert.equal(hostStatus, 403);
   assert.equal((await f.send({}, {}, '/v1/other')).status, 404);
+  assert.equal((await f.send({}, {}, '/v1/chat/completions/other')).status, 404);
+  assert.equal((await fetch(f.url + '/v1/chat/completions', { headers: { authorization: `Bearer ${TOKEN}` } })).status, 404);
   assert.equal(f.requests.length, 0);
 });
 

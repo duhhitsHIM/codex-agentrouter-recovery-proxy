@@ -55,6 +55,18 @@ Deliberate limits, because getting these wrong is worse than the bug:
 - **Retries are bounded.** Reasoning gets one retry. Optional compaction recovery gets one final
   request retry after rebuilding its dependencies; it never loops on the final request.
 
+## Chat Completions compatibility
+
+`POST /v1/chat/completions` is forwarded to the configured upstream, preserving ordinary JSON
+responses and streaming SSE chunks, including tool-call deltas, usage and `[DONE]`. Messages,
+saved tool results, media and request parameters are forwarded without Responses-specific changes.
+Tool calls in a reply are returned to the client; the proxy never executes them.
+
+Chat Completions does not use the Responses recovery path. Its errors are passed through with
+their original status and body, without reasoning filtering, compaction capture/replay or recovery
+retries. Authentication, loopback restrictions, header filtering, size limits, timeouts and the
+no-redirect policy still apply. The upstream must itself support Chat Completions.
+
 ## Optional compaction checkpoint recovery
 
 Encrypted compaction items carry conversation memory, including facts from older tool results.
@@ -242,7 +254,8 @@ will not reach it. Putting the token in `config.toml` avoids the problem entirel
 - Binds to `127.0.0.1` only, and rejects any request whose `Host` is not the loopback address or
   that carries an `Origin` header, so a browser on your machine cannot reach it.
 - Requires your own bearer token on every request and compares it in constant time.
-- Only forwards `POST /v1/responses`, `POST /v1/responses/compact` and `GET /v1/models`.
+- Only forwards `POST /v1/responses`, `POST /v1/responses/compact`, `POST /v1/chat/completions`
+  and `GET /v1/models`.
 - Never follows redirects, so the token cannot be bounced to another host.
 - Strips `Cookie` and hop-by-hop headers before forwarding.
 - Your token is read from `~/.codex/config.toml` at request time and is never written to disk or

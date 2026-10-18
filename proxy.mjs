@@ -178,7 +178,8 @@ export function createProxy({ upstream, getToken, logger = () => {}, maxBody = M
     try { token = getToken(); } catch { fail(503, 'provider_key_unavailable'); return; }
     if (!token || !sameSecret(req.headers.authorization, `Bearer ${token}`)) { fail(401, 'unauthorized'); return; }
     const route = req.url?.split('?')[0];
-    if (!((req.method === 'POST' && ['/v1/responses', '/v1/responses/compact'].includes(route)) || (req.method === 'GET' && route === '/v1/models'))) { fail(404, 'unsupported_route'); return; }
+    const responsesRoute = ['/v1/responses', '/v1/responses/compact'].includes(route);
+    if (!((req.method === 'POST' && (responsesRoute || route === '/v1/chat/completions')) || (req.method === 'GET' && route === '/v1/models'))) { fail(404, 'unsupported_route'); return; }
     if (active >= 8) { fail(503, 'proxy_busy'); return; }
     active++;
     counters.requests++;
@@ -195,7 +196,7 @@ export function createProxy({ upstream, getToken, logger = () => {}, maxBody = M
         catch { fail(400, 'invalid_json'); return; }
         if (!payload || typeof payload !== 'object' || Array.isArray(payload)) { fail(400, 'invalid_json_object'); return; }
       }
-      if (Array.isArray(payload?.input)) {
+      if (responsesRoute && Array.isArray(payload?.input)) {
         const input = payload.input.filter(item => !isOpaqueReasoning(item) || !rejected.has(digest(item.encrypted_content)));
         if (input.length !== payload.input.length) {
           counters.filtered += payload.input.length - input.length;
@@ -204,8 +205,8 @@ export function createProxy({ upstream, getToken, logger = () => {}, maxBody = M
         }
       }
       let sourcePayload = payload;
-      const scope = compactionRecovery?.scope(upstreamUrl.origin, token);
-      if (compactionRecovery) {
+      const scope = responsesRoute ? compactionRecovery?.scope(upstreamUrl.origin, token) : undefined;
+      if (responsesRoute && compactionRecovery) {
         try {
           payload = await compactionRecovery.replaceKnown(payload, scope);
           if (body) body = Buffer.from(JSON.stringify(payload));
@@ -217,8 +218,10 @@ export function createProxy({ upstream, getToken, logger = () => {}, maxBody = M
       const destination = new URL(req.url, upstreamUrl.origin);
       const send = () => fetch(destination, { method: req.method, headers, body, signal: controller.signal, redirect: 'manual' });
       let response = await send();
-      currentProbe = await probe(response);
-      const candidates = Array.isArray(payload?.input) ? payload.input.filter(isOpaqueReasoning) : [];
+      // Chat Completions has its own message/stream format. Forward it directly,
+      // including errors and tool-call deltas, without Responses recovery/probing.
+      currentProbe = responsesRoute ? await probe(response) : { chunks: [], reader: response.body?.getReader(), encryptedError: false };
+      const candidates = responsesRoute && Array.isArray(payload?.input) ? payload.input.filter(isOpaqueReasoning) : [];
       let reasoningRetried = false;
       if (currentProbe.encryptedError && candidates.length) {
         reasoningRetried = true;
@@ -303,7 +306,7 @@ export function createProxy({ upstream, getToken, logger = () => {}, maxBody = M
           response = originalResponse;
           currentProbe = originalProbe;
         }
-      } else if ([400, 422].includes(response.status) && !reasoningRetried) {
+      } else if (responsesRoute && [400, 422].includes(response.status) && !reasoningRetried) {
         log({
           event: currentProbe.encryptedError ? 'bound_item_not_recoverable' : 'unhandled_upstream_rejection',
           status: response.status,
