@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { createProxy } from './proxy.mjs';
+import { FileCompactionStore } from './compaction.mjs';
 
 export const PORT = 17863;
 export const CONFIG = path.join(os.homedir(), '.codex', 'config.toml');
@@ -28,6 +29,9 @@ if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.ar
       upstream: 'https://agentrouter.org',
       getToken: () => readAgentRouterToken(configPath),
       logger: entry => process.stdout.write(`${JSON.stringify({ at: new Date().toISOString(), ...entry })}\n`),
+      compactionStore: process.env.CODEX_RECOVERY_COMPACTION === '1'
+        ? new FileCompactionStore(process.env.CODEX_RECOVERY_STATE_DIR || path.join(os.homedir(), '.codex', 'compaction-recovery'))
+        : undefined,
     });
     server.on('error', error => {
       process.stderr.write(`${JSON.stringify({ event: 'startup_failed', code: error.code ?? 'unknown' })}\n`);

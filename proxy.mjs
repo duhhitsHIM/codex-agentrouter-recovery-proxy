@@ -3,6 +3,7 @@ import { createHash, timingSafeEqual } from 'node:crypto';
 import { once } from 'node:events';
 import { promisify } from 'node:util';
 import { gunzip, inflate, brotliDecompress } from 'node:zlib';
+import { CompactionRecovery, CompactionResult, isCompaction, isCompactionRequest } from './compaction.mjs';
 
 const MAX_BODY = 64 * 1024 * 1024;
 const MAX_PROBE = 256 * 1024;
@@ -85,7 +86,9 @@ async function probe(response) {
   const reader = response.body?.getReader();
   if (!reader) return { chunks: [], reader: null, encryptedError: false };
   const chunks = [];
-  const isSse = response.headers.get('content-type')?.includes('text/event-stream');
+  // Some Responses gateways omit Content-Type even for streamed rejections.
+  const contentType = response.headers.get('content-type');
+  const isSse = !contentType || contentType.includes('text/event-stream');
   const inspectJson = response.status === 400 || response.status === 422 || response.headers.get('content-type')?.includes('application/json');
   if (!isSse && !inspectJson) return { chunks, reader, encryptedError: false };
   let size = 0;
@@ -133,11 +136,12 @@ async function writeChunk(res, chunk, signal) {
   if (!res.write(chunk)) await once(res, 'drain', { signal });
 }
 
-export function createProxy({ upstream, getToken, logger = () => {}, maxBody = MAX_BODY, timeoutMs = 600_000 }) {
+export function createProxy({ upstream, getToken, logger = () => {}, maxBody = MAX_BODY, timeoutMs = 600_000, compactionStore }) {
   const upstreamUrl = new URL(upstream);
   if (upstreamUrl.protocol !== 'https:' && !(upstreamUrl.protocol === 'http:' && upstreamUrl.hostname === '127.0.0.1')) throw new Error('HTTPS upstream required');
   const rejected = new Set();
-  const counters = { requests: 0, retries: 0, recovered: 0, filtered: 0 };
+  const compactionRecovery = compactionStore ? new CompactionRecovery(compactionStore) : null;
+  const counters = { requests: 0, retries: 0, recovered: 0, filtered: 0, compactionRetries: 0, compactionRecovered: 0, compactionReplays: 0 };
   // A bounded trace of what just happened, so /health explains a retries-vs-recovered
   // gap on its own instead of sending someone off to correlate log timestamps.
   const recent = [];
@@ -174,7 +178,8 @@ export function createProxy({ upstream, getToken, logger = () => {}, maxBody = M
     try { token = getToken(); } catch { fail(503, 'provider_key_unavailable'); return; }
     if (!token || !sameSecret(req.headers.authorization, `Bearer ${token}`)) { fail(401, 'unauthorized'); return; }
     const route = req.url?.split('?')[0];
-    if (!((req.method === 'POST' && ['/v1/responses', '/v1/responses/compact'].includes(route)) || (req.method === 'GET' && route === '/v1/models'))) { fail(404, 'unsupported_route'); return; }
+    const responsesRoute = ['/v1/responses', '/v1/responses/compact'].includes(route);
+    if (!((req.method === 'POST' && (responsesRoute || route === '/v1/chat/completions')) || (req.method === 'GET' && route === '/v1/models'))) { fail(404, 'unsupported_route'); return; }
     if (active >= 8) { fail(503, 'proxy_busy'); return; }
     active++;
     counters.requests++;
@@ -191,7 +196,7 @@ export function createProxy({ upstream, getToken, logger = () => {}, maxBody = M
         catch { fail(400, 'invalid_json'); return; }
         if (!payload || typeof payload !== 'object' || Array.isArray(payload)) { fail(400, 'invalid_json_object'); return; }
       }
-      if (Array.isArray(payload?.input)) {
+      if (responsesRoute && Array.isArray(payload?.input)) {
         const input = payload.input.filter(item => !isOpaqueReasoning(item) || !rejected.has(digest(item.encrypted_content)));
         if (input.length !== payload.input.length) {
           counters.filtered += payload.input.length - input.length;
@@ -199,17 +204,30 @@ export function createProxy({ upstream, getToken, logger = () => {}, maxBody = M
           body = Buffer.from(JSON.stringify(payload));
         }
       }
+      let sourcePayload = payload;
+      const scope = responsesRoute ? compactionRecovery?.scope(upstreamUrl.origin, token) : undefined;
+      if (responsesRoute && compactionRecovery) {
+        try {
+          payload = await compactionRecovery.replaceKnown(payload, scope);
+          if (body) body = Buffer.from(JSON.stringify(payload));
+        } catch { log({ event: 'compaction_cache_unavailable' }); }
+      }
       const headers = headersFor(req.headers);
       headers.authorization = `Bearer ${token}`;
       headers['accept-encoding'] = 'identity';
       const destination = new URL(req.url, upstreamUrl.origin);
       const send = () => fetch(destination, { method: req.method, headers, body, signal: controller.signal, redirect: 'manual' });
       let response = await send();
-      currentProbe = await probe(response);
-      const candidates = Array.isArray(payload?.input) ? payload.input.filter(isOpaqueReasoning) : [];
+      // Chat Completions has its own message/stream format. Forward it directly,
+      // including errors and tool-call deltas, without Responses recovery/probing.
+      currentProbe = responsesRoute ? await probe(response) : { chunks: [], reader: response.body?.getReader(), encryptedError: false };
+      const candidates = responsesRoute && Array.isArray(payload?.input) ? payload.input.filter(isOpaqueReasoning) : [];
+      let reasoningRetried = false;
       if (currentProbe.encryptedError && candidates.length) {
+        reasoningRetried = true;
         await currentProbe.reader?.cancel();
         payload = { ...payload, input: payload.input.filter(item => !isOpaqueReasoning(item)) };
+        sourcePayload = { ...sourcePayload, input: sourcePayload.input.filter(item => !isOpaqueReasoning(item)) };
         body = Buffer.from(JSON.stringify(payload));
         counters.retries++;
         log({ event: 'encrypted_reasoning_retry', removed: candidates.length });
@@ -230,22 +248,98 @@ export function createProxy({ upstream, getToken, logger = () => {}, maxBody = M
             reason: currentProbe.encryptedError ? 'still_rejected' : 'upstream_failure',
           });
         }
-      } else if ([400, 422].includes(response.status)) {
+      }
+      if (currentProbe.encryptedError && compactionRecovery && route === '/v1/responses' && payload?.input?.some(isCompaction)) {
+        await currentProbe.reader?.cancel();
+        currentProbe.reader = null;
+        const originalResponse = response;
+        const originalProbe = currentProbe;
+        counters.compactionRetries++;
+        log({ event: 'compaction_recovery_started' });
+        try {
+          const rebuild = async checkpoint => {
+            controller.signal.throwIfAborted();
+            let request = checkpoint;
+            const sendCheckpoint = () => fetch(new URL('/v1/responses', upstreamUrl.origin), {
+              method: 'POST', headers, body: Buffer.from(JSON.stringify(request)), signal: controller.signal, redirect: 'manual',
+            });
+            let replayResponse = await sendCheckpoint();
+            let prelude = await probe(replayResponse);
+            if (prelude.encryptedError && request.input.some(isOpaqueReasoning)) {
+              await prelude.reader?.cancel();
+              request = { ...request, input: request.input.filter(item => !isOpaqueReasoning(item)) };
+              replayResponse = await sendCheckpoint();
+              prelude = await probe(replayResponse);
+            }
+            try {
+              if (!replayResponse.ok || prelude.encryptedError || prelude.failed) throw Object.assign(new Error('compaction_replay_failed'), {
+                code: prelude.encryptedError ? 'checkpoint_target_rejected' : 'compaction_replay_failed',
+              });
+              const collector = new CompactionResult();
+              for (const chunk of prelude.chunks) collector.push(chunk);
+              if (prelude.reader) {
+                while (true) {
+                  const { done, value } = await prelude.reader.read();
+                  if (done) break;
+                  collector.push(value);
+                }
+              }
+              const item = collector.finish();
+              if (!item) throw new Error('compaction_replay_failed');
+              counters.compactionReplays++;
+              log({ event: 'compaction_checkpoint_rebuilt' });
+              return { item, payload: request };
+            } finally { await prelude.reader?.cancel().catch(() => {}); }
+          };
+          payload = await compactionRecovery.recover(sourcePayload, scope, payload.input, rebuild, controller.signal);
+          body = Buffer.from(JSON.stringify(payload));
+          response = await send();
+          currentProbe = await probe(response);
+          if (response.ok && !currentProbe.encryptedError && !currentProbe.failed) {
+            counters.compactionRecovered++;
+            log({ event: 'compaction_recovered' });
+          } else log({ event: 'compaction_retry_failed', status: response.status });
+        } catch {
+          // Preserve the original rejection when a checkpoint is missing or a
+          // replay fails. Never silently drop a compaction or its dependencies.
+          log({ event: 'compaction_recovery_failed' });
+          response = originalResponse;
+          currentProbe = originalProbe;
+        }
+      } else if (responsesRoute && [400, 422].includes(response.status) && !reasoningRetried) {
         log({
           event: currentProbe.encryptedError ? 'bound_item_not_recoverable' : 'unhandled_upstream_rejection',
           status: response.status,
           ...describeError(currentProbe.chunks),
         });
       }
+      const capture = compactionRecovery && route === '/v1/responses' && response.ok && isCompactionRequest(payload) ? new CompactionResult() : null;
+      let checkpointSaved = false;
+      const saveCheckpoint = async item => {
+        if (!item || checkpointSaved) return;
+        checkpointSaved = true;
+        try {
+          await compactionStore.remember(item, payload);
+          log({ event: 'compaction_checkpoint_saved' });
+        } catch { log({ event: 'compaction_checkpoint_save_failed' }); }
+      };
+      const forward = async chunk => {
+        capture?.push(chunk);
+        // Persist before releasing the completed event: a client may immediately
+        // switch accounts or start its next turn without waiting for HTTP EOF.
+        await saveCheckpoint(capture?.result());
+        await writeChunk(res, chunk, controller.signal);
+      };
       res.writeHead(response.status, headersFor(response.headers));
-      for (const chunk of currentProbe.chunks) await writeChunk(res, chunk, controller.signal);
+      for (const chunk of currentProbe.chunks) await forward(chunk);
       if (currentProbe.reader) {
         while (true) {
           const { done, value } = await currentProbe.reader.read();
           if (done) break;
-          await writeChunk(res, value, controller.signal);
+          await forward(value);
         }
       }
+      await saveCheckpoint(capture?.finish());
       res.end();
     } catch (error) {
       log({ event: controller.signal.aborted ? 'request_aborted' : 'request_failed', status: error.status ?? 502 });
